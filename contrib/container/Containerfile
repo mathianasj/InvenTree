@@ -1,6 +1,160 @@
-FROM inventree/inventree:stable
+# The InvenTree dockerfile provides two build targets:
+#
+# production:
+# - Required files are copied into the image
+# - Runs InvenTree web server under gunicorn
+#
+# dev:
+# - Expects source directories to be loaded as a run-time volume
+# - Runs InvenTree web server under django development server
+# - Monitors source files for any changes, and live-reloads server
+
+FROM python:3.11-alpine3.20 AS inventree_base
+
+ENV HOME /home/ocp
+
+RUN mkdir -p ${HOME} && chmod 777 ${HOME}
+
+# Build arguments for this image
+ARG commit_tag=""
+ARG commit_hash=""
+ARG commit_date=""
+
+ARG data_dir="data"
+
+ENV PYTHONUNBUFFERED=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV INVOKE_RUN_SHELL="/bin/ash"
+
+ENV INVENTREE_DOCKER="true"
+
+# InvenTree paths
+ENV INVENTREE_HOME="/home/inventree"
+ENV INVENTREE_DATA_DIR="${INVENTREE_HOME}/${data_dir}"
+ENV INVENTREE_STATIC_ROOT="${INVENTREE_DATA_DIR}/static"
+ENV INVENTREE_MEDIA_ROOT="${INVENTREE_DATA_DIR}/media"
+ENV INVENTREE_BACKUP_DIR="${INVENTREE_DATA_DIR}/backup"
+ENV INVENTREE_PLUGIN_DIR="${INVENTREE_DATA_DIR}/plugins"
+
+ENV INVENTREE_BACKEND_DIR="${INVENTREE_HOME}/src/backend"
+
+# InvenTree configuration files
+ENV INVENTREE_CONFIG_FILE="${INVENTREE_DATA_DIR}/config.yaml"
+ENV INVENTREE_SECRET_KEY_FILE="${INVENTREE_DATA_DIR}/secret_key.txt"
+ENV INVENTREE_PLUGIN_FILE="${INVENTREE_DATA_DIR}/plugins.txt"
+
+# Worker configuration (can be altered by user)
+ENV INVENTREE_GUNICORN_WORKERS="4"
+ENV INVENTREE_BACKGROUND_WORKERS="4"
+
+# Default web server address:port
+ENV INVENTREE_WEB_ADDR=0.0.0.0
+ENV INVENTREE_WEB_PORT=8000
+
+LABEL org.opencontainers.image.vendor="inventree" \
+      org.opencontainers.image.title="InvenTree backend server" \
+      org.opencontainers.image.description="InvenTree is the open-source inventory management system" \
+      org.opencontainers.image.url="https://inventree.org" \
+      org.opencontainers.image.documentation="https://docs.inventree.org" \
+      org.opencontainers.image.source="https://github.com/inventree/InvenTree" \
+      org.opencontainers.image.revision=${commit_hash} \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version=${commit_tag}
+
+
+# Install required system level packages
+RUN apk add --no-cache \
+    git gettext py-cryptography \
+    # Image format support
+    libjpeg libwebp zlib \
+    # Weasyprint requirements : https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#alpine-3-12
+    py3-pip py3-pillow py3-cffi py3-brotli pango poppler-utils openldap \
+    # Postgres client (note: backwards compatible with postgres server <= 16)
+    postgresql16-client \
+    # MySQL / MariaDB client
+    mariadb-client mariadb-connector-c \
+    && \
+    # font support
+    apk --update --upgrade --no-cache add fontconfig ttf-freefont font-terminus font-noto font-noto-cjk font-noto-extra \
+    && fc-cache -f
+
+EXPOSE 8000
+
+RUN mkdir -p ${INVENTREE_HOME} && chmod 777 ${INVENTREE_HOME}
+WORKDIR ${INVENTREE_HOME}
 
 USER 1001
 
-ENV HOME /home/ocp
-ADD init.sh /home/inventree/init.sh
+COPY contrib/container/requirements.txt base_requirements.txt
+COPY src/backend/requirements.txt ./
+COPY contrib/container/install_build_packages.sh .
+USER 0
+RUN chmod +x install_build_packages.sh
+USER 1001
+
+# For ARMv7 architecture, add the piwheels repo (for cryptography library)
+# Otherwise, we have to build from source, which is difficult
+# Ref: https://github.com/inventree/InvenTree/pull/4598
+RUN if [ `apk --print-arch` = "armv7" ]; then \
+    printf "[global]\nextra-index-url=https://www.piwheels.org/simple\n" > /etc/pip.conf ; \
+    fi
+
+COPY tasks.py contrib/container/gunicorn.conf.py contrib/container/init.sh ./
+USER 0
+RUN chmod +x init.sh
+USER 1001
+
+ENTRYPOINT ["/bin/ash", "./init.sh"]
+
+FROM inventree_base AS prebuild
+
+ENV PATH=/home/ocp/.local/bin:$PATH
+
+USER 0
+
+RUN ./install_build_packages.sh --no-cache --virtual .build-deps
+
+USER 1001
+
+RUN pip install --user --require-hashes -r base_requirements.txt --no-cache && \
+    pip install --user --require-hashes -r requirements.txt --no-cache
+
+USER 0
+RUN apk --purge del .build-deps
+USER 1001
+
+# Frontend builder image:
+FROM prebuild AS frontend
+
+USER 0
+RUN apk add --no-cache --update nodejs npm yarn
+RUN yarn config set network-timeout 600000 -g
+COPY src ${INVENTREE_HOME}/src
+COPY tasks.py ${INVENTREE_HOME}/tasks.py
+RUN cd ${INVENTREE_HOME} && invoke int.frontend-compile
+USER 1001
+
+# InvenTree production image:
+# - Copies required files from local directory
+# - Starts a gunicorn webserver
+FROM inventree_base AS production
+
+ENV INVENTREE_DEBUG=False
+
+# As .git directory is not available in production image, we pass the commit information via ENV
+ENV INVENTREE_COMMIT_HASH="${commit_hash}"
+ENV INVENTREE_COMMIT_DATE="${commit_date}"
+
+# use dependencies and compiled wheels from the prebuild image
+ENV PATH=/home/ocp/.local/bin:$PATH
+COPY --from=prebuild /home/ocp/.local /home/ocp/.local
+
+
+# Copy source code
+COPY src/backend/InvenTree ${INVENTREE_BACKEND_DIR}/InvenTree
+COPY src/backend/requirements.txt ${INVENTREE_BACKEND_DIR}/requirements.txt
+COPY --from=frontend ${INVENTREE_BACKEND_DIR}/InvenTree/web/static/web ${INVENTREE_BACKEND_DIR}/InvenTree/web/static/web
+
+# Launch the production server
+CMD gunicorn -c ./gunicorn.conf.py InvenTree.wsgi -b 0.0.0.0:8000 --chdir ${INVENTREE_BACKEND_DIR}/InvenTree
+
