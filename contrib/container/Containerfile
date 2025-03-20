@@ -2,7 +2,7 @@ FROM inventree/inventree:stable
 
 
 ENV HOME /root
-ADD init.sh /home/inventree/init.sh
+ADD contrib/container/init.sh /home/inventree/init.sh
 RUN chmod -R o+w /home/inventree/src/backend/InvenTree && \
      chmod -R o+x /root && \
      chmod -R o+r /root && \
